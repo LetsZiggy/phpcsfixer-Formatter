@@ -1,0 +1,18 @@
+{
+	"$schema": "sublime://packagecontrol.io/schemas/repository",
+	"schema_version": "4.0.0",
+	"packages": [
+		{
+			"name": "phpcsfixer-Formatter",
+			"details": "https://github.com/LetsZiggy/phpcsfixer-Formatter",
+			"issues": "https://github.com/LetsZiggy/phpcsfixer-Formatter/issues",
+			"readme": "https://raw.githubusercontent.com/LetsZiggy/phpcsfixer-Formatter/main/README.md",
+			"releases": [
+				{
+					"sublime_text": ">=3000",
+					"tags": true
+				}
+			]
+		}
+	]
+}

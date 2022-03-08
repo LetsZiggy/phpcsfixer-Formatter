@@ -1,0 +1,28 @@
+[
+	{
+		"id": "preferences",
+		"children": [
+			{
+				"id": "package-settings",
+				"children": [
+					{
+						"caption": "phpcsfixer Formatter",
+						"children": [
+							{
+								"caption": "Settings",
+								"command": "edit_settings",
+								"args": {
+									"base_file": "${packages}/phpcsfixer-Formatter/phpcsfixer-Formatter.sublime-settings",
+									"default": "// Settings in here override those in \"phpcsfixer-Formatter/phpcsfixer-Formatter.sublime-settings\"\n{\n\t$0\n}\n",
+								},
+							},
+							{
+								"caption": "-",
+							},
+						],
+					},
+				],
+			},
+		],
+	},
+]

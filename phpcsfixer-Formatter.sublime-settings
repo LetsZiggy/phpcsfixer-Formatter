@@ -8,21 +8,27 @@
 		"osx": "/usr/local/bin/php",
 	},
 
+	/**
+	 * The virtualenv folder name
+	 * https://getcomposer.org/doc/03-cli.md#composer-vendor-dir
+	 */
+	"vendor_folder": "vendor",
+
 	// The location to search for a locally installed phpcsfixer package
 	// These are all relative paths to a project's directory
 	// If this is not found or are false, it will try to fallback to a global package
 	// (see "phpcsfixer_path" below)
 	"local_phpcsfixer_path": {
-		"windows": "vendor/bin/php-cs-fixer",
-		"linux": "vendor/bin/php-cs-fixer",
-		"osx": "vendor/bin/php-cs-fixer",
+		"windows": "${project_path}/${vendor_folder}/bin/php-cs-fixer",
+		"linux": "${project_path}/${vendor_folder}/bin/php-cs-fixer",
+		"osx": "${project_path}/${vendor_folder}/bin/php-cs-fixer",
 	},
 
-	// The location of the globally installed phpcsfixer package to use as a fallback
+	// The location of the user/global installed phpcsfixer package to use as a fallback
 	"phpcsfixer_path": {
-		"windows": "%APPDATA%/Roaming/Composer/vendor/bin/php-cs-fixer",
-		"linux": "~/.composer/vendor/bin/php-cs-fixer",
-		"osx": "~/.composer/vendor/bin/php-cs-fixer",
+		"windows": "%APPDATA%/Roaming/Composer/${vendor_folder}/bin/php-cs-fixer",
+		"linux": "~/.composer/${vendor_folder}/bin/php-cs-fixer",
+		"osx": "~/.composer/${vendor_folder}/bin/php-cs-fixer",
 	},
 
 	// Specify this path to an phpcsfixer config file to override the default behavior

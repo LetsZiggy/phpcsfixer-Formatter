@@ -1,324 +1,252 @@
-# This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
-# If a copy of the MPL was not distributed with this file,
-# You can obtain one at http://mozilla.org/MPL/2.0/.
-import glob
-import os
-import subprocess
-import sys
+from os import path as os_path
+from pathlib import Path as pathlib_Path
 from subprocess import PIPE, Popen
+from typing import Any, Dict, Literal, Tuple, TypedDict, Union
 
 import sublime
 import sublime_plugin
 
 PROJECT_NAME = "phpcsfixer-Formatter"
-SETTINGS_FILE = PROJECT_NAME + ".sublime-settings"
+SETTINGS_FILE = f"{PROJECT_NAME}.sublime-settings"
 PLATFORM = sublime.platform()
 ARCHITECTURE = sublime.arch()
-KEYMAP_FILE = "Default (" + PLATFORM + ").sublime-keymap"
+KEYMAP_FILE = f"Default ({PLATFORM}).sublime-keymap"
 IS_WINDOWS = PLATFORM == "windows"
+CODE_COMMAND_NOT_FOUND = 127
 
 
-class FormatPhpcsfixerCommand(sublime_plugin.TextCommand):
-	def run(self, edit):
-		# Save the current viewport position to scroll to it after formatting.
-		previous_selection = list(self.view.sel())  # Copy.
-		previous_position = self.view.viewport_position()
+class SettingsData(TypedDict):
+	variables: Dict[str, Any]
+	config: Dict[str, Any]
+	position: Any
+	selections: Any
+	fold: Any
+	content: str
+	cmd: str
 
-		# Save the already folded code to refold it after formatting.
-		# Backup of folded code is taken instead of regions because the start and end pos
-		# of folded regions will change once formatted.
-		folded_regions_content = [self.view.substr(region) for region in self.view.folded_regions()]
 
-		# Get the current text in the buffer and save it in a temporary file.
-		# This allows for scratch buffers and dirty files to be linted as well.
-		# entire_buffer_region = sublime.Region(0, self.view.size()) # NOT USED
+class Settings:
+	data: SettingsData = {
+		"variables": {},
+		"config": {},
+		"position": None,
+		"selections": None,
+		"fold": None,
+		"content": "",
+		"cmd": "",
+	}
 
-		[stdout, stderr] = self.run_script_on_file(filename=self.view.file_name())
+	@classmethod
+	def set_settings(cls, view: sublime.View, variables: Dict[str, str]) -> None:
+		settings_default = sublime.load_settings(SETTINGS_FILE).to_dict()
+		settings_default = {k: v for k, v in Settings.flatten_dict(settings_default)}
+		cls.data["config"] = settings_default
 
-		# log output in debug mode
-		if PluginUtils.get_pref(["debug"], self.view):
-			print(f">>> stderr:\n{stderr}>>> stdout:\n{stdout}")
+		settings_user = view.settings().to_dict()
+		settings_user = {k: v for k, v in settings_user.items() if "phpcsfixer-Formatter" in k}
+		settings_user = {k[21:]: v for k, v in Settings.flatten_dict(settings_user)}
+		cls.data["config"].update(settings_user)
 
-		self.refold_folded_regions(folded_regions_content, stdout)
-		self.view.set_viewport_position((0, 0), False)
-		self.view.set_viewport_position(previous_position, False)
-		self.view.sel().clear()
+		variables.update({k: v for k, v in cls.data["config"].items() if "." not in k and isinstance(v, str)})
+		cls.data["variables"] = variables
 
-		# Restore the previous selection if formatting wasn't performed only for it.
-		# if not is_formatting_selection_only:
-		for region in previous_selection:
-			self.view.sel().add(region)
+		for k, v in cls.data["config"].items():
+			if isinstance(v, str) and "${" in v and "}" in v:
+				v = sublime.expand_variables(v, cls.data["variables"])
+				cls.data["config"][k] = v
 
-	def get_lint_directory(self, filename):
-		project_path = PluginUtils.project_path(None)
+			if isinstance(v, str) and "path" in k:
+				v = os_path.normpath(os_path.expanduser(v))
+				cls.data["config"][k] = v
 
-		if project_path is not None:
-			return PluginUtils.normalize_path(project_path)
+	@classmethod
+	def flatten_dict(cls, obj: Dict[str, Any], keystring: str = ""):
+		if isinstance(obj, dict):
+			keystring = f"{keystring}." if keystring else keystring
 
-		if filename is not None:
-			cdir = os.path.dirname(filename)
+			for k in obj:
+				yield from Settings.flatten_dict(obj[k], keystring + str(k))
+		else:
+			yield keystring, obj
 
-			if os.path.exists(cdir):
-				return cdir
+	@classmethod
+	def verify_settings(cls) -> None:
+		php_path_exist: Union[Literal[True], Tuple[str, str]] = True
+		phpcsfixer_path_exist: Dict[Literal["local", "fallback"], Union[Literal[True], Tuple[str, str]]] = {
+			"local": True,
+			"fallback": True,
+		}
 
-		return os.getcwd()
+		for k, v in cls.data["config"].items():
+			if isinstance(v, str) and "php_" in k and "path" in k and PLATFORM.lower() in k:
+				php_path_exist = True if os_path.exists(v) else (k, v)
 
-	def run_script_on_file(self, filename=None):
-		try:
-			dirname = filename and os.path.dirname(filename)
-			php_path = PluginUtils.get_php_path(self.view)
-			phpcsfixer_path = PluginUtils.get_phpcsfixer_path(dirname, self.view)
+			if isinstance(v, str) and "phpcsfixer_" in k and "path" in k and PLATFORM.lower() in k:
+				if "local" in k:
+					phpcsfixer_path_exist["local"] = True if os_path.exists(v) else (k, v)
 
-			if phpcsfixer_path is False:
-				sublime.error_message("phpcsfixer could not be found on your path")
-				return
+				if "local" not in k:
+					phpcsfixer_path_exist["fallback"] = True if os_path.exists(v) else (k, v)
 
-			if filename is None:
-				sublime.error_message("Cannot lint unsaved file")
+		if php_path_exist is not True:
+			sublime.error_message("php path does not exist. See console output.")
+			raise Exception(f"\n>>> `php_path` does not exist: {php_path_exist[0]} -> {php_path_exist[1]}")
 
-			# Better support globally-available phpcsfixer binaries that don't need to be invoked with php.
-			php_cmd = [php_path] if php_path else []
-			cmd = php_cmd + [phpcsfixer_path, "fix", filename]
+		if phpcsfixer_path_exist["local"] is not True and phpcsfixer_path_exist["fallback"] is not True:
+			sublime.error_message("phpcsfixer path does not exist. See console output.")
+			raise Exception(
+				"\n>>> `local_phpcsfixer_path` does not exist: "
+				+ f"{phpcsfixer_path_exist['local'][0]} -> {phpcsfixer_path_exist['local'][1]}"
+				+ "\n>>> `phpcsfixer_path` does not exist: "
+				+ f"{phpcsfixer_path_exist['fallback'][0]} -> {phpcsfixer_path_exist['fallback'][1]}"
+			)
 
-			project_path = PluginUtils.project_path()
-			config_path = PluginUtils.get_pref(["config_path"], self.view)
-			config_path = sublime.expand_variables(config_path, sublime.active_window().extract_variables())
-			extra_args = PluginUtils.get_pref(["extra_args"], self.view)
+	@classmethod
+	def set_file_data(cls, position=None, selections=None, fold=None, content=None, cmd=None) -> None:
+		if position:
+			cls.data["position"] = position
+		if selections:
+			cls.data["selections"] = selections
+		if fold:
+			cls.data["fold"] = fold
+		if content:
+			cls.data["content"] = content
+		if cmd:
+			cls.data["cmd"] = cmd
 
-			if os.path.isfile(config_path):
-				# If config file path exists, use as is
-				full_config_path = config_path
-			else:
-				# Find config file relative to project path
-				full_config_path = os.path.join(project_path, ".php-cs-fixer.dist.php")
+	@staticmethod
+	def get_settings(view: sublime.View) -> SettingsData:
+		variables = view.window().extract_variables()
 
-			if os.path.isfile(full_config_path):
-				cmd.extend([f"--config={full_config_path}"])
-				print(f">>> Using configuration from {full_config_path}")
+		if (
+			variables["file_extension"] == "sublime-project"
+			or len(Settings.data["variables"]) == 0
+			or len(Settings.data["config"]) == 0
+			or Settings.data["variables"]["file"] != view.file_name()
+			or Settings.data["variables"]["file_extension"] != variables["file_extension"]
+		):
+			Settings.set_settings(view, variables)
 
-			if extra_args:
-				cmd += [arg.replace("$project_path", project_path) for arg in extra_args]
-
-			if PluginUtils.get_pref(["debug"], self.view):
-				cmd = [arg for arg in cmd if arg not in ["-q", "--quiet"]]
-				cmd += ["-vvv"]
-				print(">>> phpcsfixer command line", cmd)
-			else:
-				cmd = [arg for arg in cmd if arg not in ["-v", "-vv", "-vvv", "--verbose"]]
-				cmd += ["-q"]
-
-			cdir = self.get_lint_directory(filename)
-
-			[stdout, stderr] = PluginUtils.get_output(cmd, cdir)
-
-			return [stdout, stderr]
-
-		except:
-			# Something bad happened.
-			msg = str(sys.exc_info()[1])
-			print(f"Unexpected error({sys.exc_info()[0]}): {msg}")
-			sublime.error_message(msg)
-
-	def refold_folded_regions(self, folded_regions_content, entire_file_contents):
-		self.view.unfold(sublime.Region(0, len(entire_file_contents)))
-		region_end = 0
-
-		for content in folded_regions_content:
-			region_start = entire_file_contents.index(content, region_end)
-			if region_start > -1:
-				region_end = region_start + len(content)
-				self.view.fold(sublime.Region(region_start, region_end))
+		return Settings.data
 
 
 class PhpcsfixerFormatterEventListeners(sublime_plugin.EventListener):
 	@staticmethod
-	def should_run_command(view):
-		if not PluginUtils.get_pref(["format_on_save"], view):
-			return False
+	def should_run_command(view: sublime.View, settings: SettingsData) -> bool:
+		extensions = settings["config"]["format_on_save_extensions"]
+		extension = settings["variables"]["file_extension"] or settings["variables"]["file_name"].split(".")[-1]
 
-		extensions = PluginUtils.get_pref(["format_on_save_extensions"], view)
-		extension = os.path.splitext(view.file_name())[1][1:]
-
-		# Default to using filename if no extension
-		if not extension:
-			extension = os.path.basename(view.file_name())
-
-		# Skip if extension is not listed
 		return not extensions or extension in extensions
 
 	@staticmethod
-	def on_post_save(view):
-		if PhpcsfixerFormatterEventListeners.should_run_command(view):
+	def on_post_save(view: sublime.View) -> None:
+		settings = Settings.get_settings(view)
+
+		if settings["config"]["format_on_save"] and PhpcsfixerFormatterEventListeners.should_run_command(
+			view, settings
+		):
 			view.run_command("format_phpcsfixer")
 
-
-class PluginUtils:
 	@staticmethod
-	# Fetches root path of open project
-	def project_path(fallback=os.getcwd()):
-		project_data = sublime.active_window().project_data()
+	def on_reload(view: sublime.View) -> None:
+		settings = Settings.get_settings(view)
 
-		# if cannot find project data, use cwd
-		if project_data is None:
-			return fallback
+		buffer_region = sublime.Region(0, view.size())
+		new_content = view.substr(buffer_region)
 
-		folders = project_data["folders"]
-		folder_path = folders[0]["path"]
+		if new_content != settings["content"] and not settings["config"]["debug"]:
+			Settings.set_file_data(content=new_content)
+			print(">>> phpcsfixer-Formatter (success):", settings["cmd"])
 
-		if folder_path == ".":
-			folder_path = sublime.active_window().folders()[0]
+		# Reapply code folds
+		view.unfold(sublime.Region(0, view.size()))
+		region_start = -1
+		region_end = 0
 
-		return folder_path
+		for region in settings["fold"]:
+			try:
+				region_start = new_content.find(region, region_end)
+			finally:
+				if region_start > -1:
+					region_end = region_start + len(region)
+					view.fold(sublime.Region(region_start, region_end))
 
-	@staticmethod
-	def get_pref(key_list, view=None):
-		if view is not None:
-			settings = view.settings()
+		# Reapply viewport position
+		view.set_viewport_position((0, 0), False)
+		view.set_viewport_position(settings["position"], False)
+		view.sel().clear()
 
-			# Flat settings in .sublime-project
-			flat_keys = ".".join(key_list)
-			if settings.has(f"{PROJECT_NAME}.{flat_keys}"):
-				value = settings.get(f"{PROJECT_NAME}.{flat_keys}")
-				return value
+		# Reapply cursor position and buffer selections
+		for selection in settings["selections"]:
+			view.sel().add(selection)
 
-			# Nested settings in .sublime-project
-			if settings.has(PROJECT_NAME):
-				value = settings.get(PROJECT_NAME)
+		# Set new cursor position, selections, folded regions
+		viewport_position = view.viewport_position()
+		selections = list(view.sel())
+		folded_regions = [view.substr(region) for region in view.folded_regions()]
+		Settings.set_file_data(position=viewport_position, selections=selections, fold=folded_regions)
 
-				for key in key_list:
-					try:
-						value = value[key]
-					except:
-						value = None
-						break
 
-				if value is not None:
-					return value
+class FormatPhpcsfixerCommand(sublime_plugin.TextCommand):
+	def run(self, edit) -> None:
+		settings = Settings.get_settings(self.view)
 
-		global_settings = sublime.load_settings(SETTINGS_FILE)
-		value = global_settings.get(key_list[0])
-
-		# Load active project settings
-		project_settings = sublime.active_window().active_view().settings()
-
-		# Overwrite global config value if it's defined
-		if project_settings.has(PROJECT_NAME):
-			value = project_settings.get(PROJECT_NAME).get(key_list[0], value)
-
-		return value
-
-	@staticmethod
-	def get_php_path(view=None):
-		platform = sublime.platform()
-
-		# .sublime-project
-		php = PluginUtils.get_pref(["php_path", platform], view)
-
-		# .sublime-settings
-		php = php.get(platform) if isinstance(php, dict) else php
-
-		if isinstance(php, str):
-			print(f">>> Using php path on '{platform}': {php}")
+		if not PhpcsfixerFormatterEventListeners.should_run_command(self.view, settings):
+			print(">>> phpcsfixer-Formatter: File type not supported")
+			return
 		else:
-			print("Not using explicit php path")
+			Settings.verify_settings()
 
-		return php
+		viewport_position = self.view.viewport_position()
+		selections = list(self.view.sel())
+		folded_regions = [self.view.substr(region) for region in self.view.folded_regions()]
+		Settings.set_file_data(position=viewport_position, selections=selections, fold=folded_regions)
 
-	# Convert path that possibly contains a user tilde and/or is a relative path into an absolute path.
-	@staticmethod
-	def normalize_path(path, realpath=False):
-		if realpath:
-			return os.path.realpath(os.path.expanduser(path))
-		else:
-			project_dir = sublime.active_window().project_file_name()
-			cwd = os.path.dirname(project_dir) if project_dir else os.getcwd()
-			return os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
+		cmd_phpcsfixer = [
+			settings["config"][f"local_phpcsfixer_path.{PLATFORM}".lower()]
+			or settings["config"][f"phpcsfixer_path.{PLATFORM}".lower()]
+		]
+		is_bin_cmd_phpcsfixer = len(pathlib_Path(cmd_phpcsfixer[0]).suffix) == 0
+		cmd_php = [settings["config"][f"php_path.{PLATFORM}".lower()]] if not is_bin_cmd_phpcsfixer else []
+		cmd_config = ["--config", f"{settings['config']['config_path']}"] if settings["config"]["config_path"] else []
+		cmd_extra = list(
+			filter(
+				lambda v: v not in {"-q", "--quiet", "-v", "-vv", "-vvv", "--verbose"},
+				settings["config"]["extra_args"],
+			)
+		) + (["-vvv"] if settings["config"]["debug"] else ["-q"])
+		cmd_filename = [f"{settings['variables']['file']}"]
+		cmd = [v for v in (cmd_php + cmd_phpcsfixer + ["fix"] + cmd_config + cmd_extra + cmd_filename) if len(v)]
 
-	# Yield path and every directory above path.
-	@staticmethod
-	def walk_up(path):
-		curr_path = path
-		while 1:
-			yield curr_path
-			curr_path, tail = os.path.split(curr_path)
-			if not tail:
-				break
+		buffer_region = sublime.Region(0, self.view.size())
+		content = self.view.substr(buffer_region)
+		Settings.set_file_data(content=content, cmd=" ".join(cmd))
 
-	# Find the first path matching a given pattern within dirname or the nearest ancestor of dirname.
-	@staticmethod
-	def findup(pattern, dirname=None):
-		if dirname is None:
-			project_path = PluginUtils.project_path()
-			normalized_directory = PluginUtils.normalize_path(project_path)
-		else:
-			normalized_directory = PluginUtils.normalize_path(dirname)
-
-		for directory in PluginUtils.walk_up(normalized_directory):
-			matches = glob.glob(os.path.join(directory, pattern))
-			if matches:
-				return matches[0]
-
-		return None
-
-	@staticmethod
-	def get_local_phpcsfixer(dirname, view=None):
-		pkg = PluginUtils.findup("vendor/php-cs-fixer", dirname)
-		if pkg is None:
-			return None
-		else:
-			platform = sublime.platform()
-
-			# .sublime-project
-			path = PluginUtils.get_pref(["local_phpcsfixer_path", platform], view)
-
-			# .sublime-settings
-			path = path.get(platform) if isinstance(path, dict) else path
-
-			if not path:
-				return None
-
-			directory = os.path.dirname(os.path.dirname(pkg))
-			local_phpcsfixer_path = os.path.join(directory, path)
-
-			if os.path.isfile(local_phpcsfixer_path):
-				return local_phpcsfixer_path
-			else:
-				return None
-
-	@staticmethod
-	def get_phpcsfixer_path(dirname, view=None):
-		platform = sublime.platform()
-		phpcsfixer = dirname and PluginUtils.get_local_phpcsfixer(dirname, view)
-
-		# if local phpcsfixer not available, then using the settings config
-		if phpcsfixer is None:
-			# .sublime-project
-			phpcsfixer = PluginUtils.get_pref(["phpcsfixer_path", platform], view)
-
-			# .sublime-settings
-			phpcsfixer = phpcsfixer.get(platform) if isinstance(phpcsfixer, dict) else phpcsfixer
-
-		print(f">>> Using phpcsfixer path on '{platform}': {phpcsfixer}")
-		return phpcsfixer
-
-	@staticmethod
-	def get_output(cmd, cdir):
 		try:
-			info = None
-			if os.name == "nt":
-				info = subprocess.STARTUPINFO()
-				info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-				info.wShowWindow = subprocess.SW_HIDE
-
-			process = Popen(cmd, stdout=PIPE, stdin=PIPE, stderr=PIPE, startupinfo=info, cwd=cdir, shell=IS_WINDOWS)
+			p = Popen(
+				cmd,
+				stdout=PIPE,
+				stdin=PIPE,
+				stderr=PIPE,
+				cwd=settings["variables"]["project_path"] or settings["variables"]["file_path"],
+				shell=IS_WINDOWS,
+			)
 		except OSError:
-			raise Exception("Couldn't find php. Make sure it's in your $PATH by running `php -v` in your command-line.")
+			sublime.error_message("Couldn't find php. See console output.")
+			raise Exception(
+				"\n>>> Couldn't find php. Make sure it's in your $PATH by running `php -v` in your command-line."
+			)
 
-		stdout, stderr = process.communicate()
+		stdout, stderr = p.communicate()
 		stdout = stdout.decode("utf-8")
 		stderr = stderr.decode("utf-8")
 
-		if process.returncode == 127:
-			raise Exception(f">>> stderr:\n{stderr}>>> stdout:\n{stdout}")
-		else:
-			return [stdout, stderr]
+		if stderr and settings["config"]["debug"]:
+			print(">>> phpcsfixer-Formatter:", " ".join(cmd))
+			print(">>> Debug:", stderr)
+		elif stderr:
+			sublime.error_message(stderr)
+			raise Exception(f"Error: {stderr}")
+		elif p.returncode == CODE_COMMAND_NOT_FOUND:
+			sublime.error_message(stderr or stdout)
+			raise Exception(f"Error: {(stderr or stdout)}")

@@ -1,0 +1,17 @@
+{
+    "name": "shafiq/phpcsfixer-formatter",
+    "autoload": {
+        "psr-4": {
+            "Shafiq\\PhpcsfixerFormatter\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Shafiq Tahir",
+            "email": "shafiqtahir.khan@gmail.com"
+        }
+    ],
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "*"
+    }
+}
